@@ -1,0 +1,32 @@
+# Private documents (case-insensitive extensions)
+*.[dD][oO][cC]
+*.[dD][oO][cC][xX]
+*.[dD][oO][cC][mM]
+*.[pP][dD][fF]
+*.[oO][dD][tT]
+*.[rR][tT][fF]
+
+# Local Python environment and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE settings
+.idea/
+.vscode/
+
+# Generated recordings and report evidence
+output/
+report_evidence/
+
+# Downloaded third-party source
+external/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
