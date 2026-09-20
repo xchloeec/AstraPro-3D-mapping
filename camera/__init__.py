@@ -3,6 +3,7 @@
 from .depth_camera import DepthCamera, OpenNIError
 from .rgb_camera import RGBCamera, RGBCameraError
 from .rgbd_camera import RGBDCamera
+from .rgbd_adapter import RGBDFrameAdapter, StandardRGBDFrame
 
 __all__ = [
     "DepthCamera",
@@ -10,4 +11,6 @@ __all__ = [
     "RGBCamera",
     "RGBCameraError",
     "RGBDCamera",
+    "RGBDFrameAdapter",
+    "StandardRGBDFrame",
 ]

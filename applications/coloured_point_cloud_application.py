@@ -6,6 +6,7 @@ import sys
 import time
 
 import cv2
+import numpy as np
 
 from camera import OpenNIError, RGBCameraError, RGBDCamera
 from processing import ColouredPointCloudGenerator, DepthIntrinsics
@@ -106,6 +107,21 @@ class ColouredPointCloudApplication:
             if point_count == 0:
                 print("Coloured point-cloud generation failed: no valid points.")
                 return 1
+
+            # Convert OpenNI/Open3D camera coordinates (X-right, Y-down,
+            # Z-forward) to the same conventional Z-up frame used by the
+            # room reconstruction stages.
+            point_cloud.transform(
+                np.asarray(
+                    [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, -1.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                    dtype=np.float64,
+                )
+            )
 
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             ply_save_started = time.perf_counter()

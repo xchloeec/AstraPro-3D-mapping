@@ -10,7 +10,7 @@ import time
 class RoomRecordingSupervisor:
     """Keep one recording folder across native-camera worker restarts."""
 
-    def __init__(self, maximum_attempts: int = 3) -> None:
+    def __init__(self, maximum_attempts: int = 5) -> None:
         self.maximum_attempts = maximum_attempts
         self.project_root = Path(__file__).resolve().parent
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -22,8 +22,13 @@ class RoomRecordingSupervisor:
     def run(self) -> int:
         print(f"Room recording folder: {self.recording_path}", flush=True)
         for attempt in range(1, self.maximum_attempts + 1):
+            # A native crash can leave the Windows UVC handle temporarily busy.
+            # MSMF is preferred, while DSHOW gives us an independent fallback
+            # path instead of repeating the same failing native startup.
+            backend = "MSMF" if attempt <= 2 else "DSHOW"
             print(
-                f"Stage 9 camera attempt {attempt}/{self.maximum_attempts}...",
+                f"Stage 9 camera attempt {attempt}/{self.maximum_attempts} "
+                f"using {backend}...",
                 flush=True,
             )
             result = subprocess.run(
@@ -32,11 +37,18 @@ class RoomRecordingSupervisor:
                     str(self.worker),
                     "--output",
                     str(self.recording_path),
+                    "--rgb-backend",
+                    backend,
                 ],
                 check=False,
             )
             if result.returncode == 0:
-                return 0
+                # Import only after the native camera worker has exited.  This
+                # prevents Open3D from sharing a process with OpenNI/OpenCV
+                # camera handles, which was a source of Windows native crashes.
+                from room_reconstruction_pipeline import RoomReconstructionPipeline
+
+                return RoomReconstructionPipeline(self.recording_path).run()
             if result.returncode == 2:
                 print("Recording was stopped by the user.", flush=True)
                 return 2
@@ -47,10 +59,11 @@ class RoomRecordingSupervisor:
             )
             if attempt < self.maximum_attempts:
                 print(
-                    "Restarting the camera and resuming the same recording...",
+                    "Waiting for Windows to release the camera, then resuming "
+                    "the same recording...",
                     flush=True,
                 )
-                time.sleep(2.0)
+                time.sleep(8.0)
 
         print(
             "Recording did not reach its target. The frames already written "

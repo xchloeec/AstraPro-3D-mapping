@@ -24,6 +24,7 @@ class RoomRecordingApplication:
         target_frames: int = 600,
         capture_interval_seconds: float = 0.1,
         minimum_valid_percentage: float = 30.0,
+        rgb_backend: str = "MSMF",
     ) -> None:
         self.output_path = output_path
         self.colour_path = output_path / "color"
@@ -35,12 +36,10 @@ class RoomRecordingApplication:
         self.target_frames = target_frames
         self.capture_interval_seconds = capture_interval_seconds
         self.minimum_valid_percentage = minimum_valid_percentage
+        self.rgb_backend = rgb_backend
         self.depth_warning_percentage = 70.0
-        self.minimum_orb_matches = 80
         self.minimum_depth_mm = 400
         self.maximum_depth_mm = 5000
-        self.orb = cv2.ORB_create(nfeatures=1000)
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
 
     def run(self) -> int:
         self.colour_path.mkdir(parents=True, exist_ok=True)
@@ -60,13 +59,19 @@ class RoomRecordingApplication:
 
         existing_rows = self._read_existing_quality()
         accepted_quality = [row[0] for row in existing_rows]
-        accepted_overlap = [row[1] for row in existing_rows if row[1] >= 0]
         candidate_count = 0
         last_saved_time = 0.0
-        previous_gray = self._load_previous_saved_gray(next_index)
 
         try:
-            with RGBDCamera(rgb_camera_index=0) as camera:
+            backend = {
+                "MSMF": cv2.CAP_MSMF,
+                "DSHOW": cv2.CAP_DSHOW,
+            }[self.rgb_backend]
+            print(f"Requested RGB backend: {self.rgb_backend}", flush=True)
+            with RGBDCamera(
+                rgb_camera_index=0,
+                rgb_backends=(backend,),
+            ) as camera:
                 for _ in range(30):
                     camera.read()
 
@@ -86,22 +91,10 @@ class RoomRecordingApplication:
                     valid_percentage = self._valid_percentage(depth_mm)
                     candidate_count += 1
 
-                    current_gray = cv2.cvtColor(colour_bgr, cv2.COLOR_BGR2GRAY)
-                    good_matches, overlap_score = self._measure_rgb_overlap(
-                        previous_gray,
-                        current_gray,
-                    )
-                    overlap_ready = (
-                        previous_gray is None
-                        or good_matches >= self.minimum_orb_matches
-                    )
-
                     preview = self._create_preview(
                         colour_bgr,
                         next_index,
                         valid_percentage,
-                        good_matches,
-                        overlap_ready,
                     )
                     cv2.imshow("Stage 9 - Open3D room recording", preview)
                     key = cv2.waitKey(1) & 0xFF
@@ -115,20 +108,17 @@ class RoomRecordingApplication:
                     quality_ready = (
                         valid_percentage >= self.minimum_valid_percentage
                     )
-                    if not interval_ready or not quality_ready or not overlap_ready:
+                    if not interval_ready or not quality_ready:
                         continue
 
                     self._save_pair(next_index, depth_mm, colour_bgr)
                     self._append_quality(
                         next_index,
                         valid_percentage,
-                        good_matches,
-                        overlap_score,
+                        -1,
+                        -1.0,
                     )
                     accepted_quality.append(valid_percentage)
-                    if previous_gray is not None:
-                        accepted_overlap.append(good_matches)
-                    previous_gray = current_gray
                     next_index += 1
                     last_saved_time = now
                     print(
@@ -139,7 +129,6 @@ class RoomRecordingApplication:
 
             summary = self._write_summary(
                 accepted_quality,
-                accepted_overlap,
                 candidate_count,
             )
             print(summary, flush=True)
@@ -296,54 +285,9 @@ class RoomRecordingApplication:
                 for row in csv.DictReader(file)
             ]
 
-    def _load_previous_saved_gray(self, next_index: int) -> np.ndarray | None:
-        """Restore the visual reference when a crashed recording resumes."""
-        if next_index == 0:
-            return None
-        previous_path = self.colour_path / f"{next_index - 1:05d}.jpg"
-        previous = cv2.imread(str(previous_path), cv2.IMREAD_GRAYSCALE)
-        if previous is None:
-            raise RuntimeError(f"Could not resume from {previous_path}")
-        return previous
-
-    def _measure_rgb_overlap(
-        self,
-        previous_gray: np.ndarray | None,
-        current_gray: np.ndarray,
-    ) -> tuple[int, float]:
-        """Count repeatable ORB features shared with the last saved image."""
-        if previous_gray is None:
-            return self.minimum_orb_matches, 100.0
-
-        previous_keypoints, previous_descriptors = self.orb.detectAndCompute(
-            previous_gray, None
-        )
-        current_keypoints, current_descriptors = self.orb.detectAndCompute(
-            current_gray, None
-        )
-        if previous_descriptors is None or current_descriptors is None:
-            return 0, 0.0
-
-        good_matches = []
-        for pair in self.matcher.knnMatch(
-            previous_descriptors,
-            current_descriptors,
-            k=2,
-        ):
-            if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance:
-                good_matches.append(pair[0])
-
-        denominator = max(
-            1,
-            min(len(previous_keypoints), len(current_keypoints)),
-        )
-        score = 100.0 * len(good_matches) / denominator
-        return len(good_matches), score
-
     def _write_summary(
         self,
         quality: list[float],
-        overlap_matches: list[int],
         candidates_this_attempt: int,
     ) -> str:
         summary = "\n".join(
@@ -356,13 +300,11 @@ class RoomRecordingApplication:
                 f"Approximate accepted rate:  {1/self.capture_interval_seconds:.1f} fps",
                 f"Quality threshold:          {self.minimum_valid_percentage:.2f}%",
                 f"Depth warning threshold:    {self.depth_warning_percentage:.2f}%",
-                f"Minimum ORB matches:        {self.minimum_orb_matches}",
+                "Online ORB overlap check:    disabled for camera stability",
                 f"Mean valid depth:           {float(np.mean(quality)):.2f}%",
                 f"Minimum valid depth:        {float(np.min(quality)):.2f}%",
                 f"Maximum valid depth:        {float(np.max(quality)):.2f}%",
-                "Mean ORB matches:            "
-                f"{float(np.mean(overlap_matches)):.1f}",
-                f"Minimum ORB matches:         {int(np.min(overlap_matches))}",
+                "ORB overlap:                 validate offline after recording",
                 f"Candidates in final attempt:{candidates_this_attempt:8d}",
             ]
         )
@@ -374,13 +316,10 @@ class RoomRecordingApplication:
         colour_bgr: np.ndarray,
         next_index: int,
         valid_percentage: float,
-        good_matches: int,
-        overlap_ready: bool,
     ) -> np.ndarray:
         preview = colour_bgr.copy()
         ready = (
             valid_percentage >= self.minimum_valid_percentage
-            and overlap_ready
         )
         colour = (60, 220, 60) if ready else (40, 40, 230)
         cv2.putText(
@@ -405,7 +344,7 @@ class RoomRecordingApplication:
         )
         cv2.putText(
             preview,
-            f"ORB overlap {good_matches} matches (need {self.minimum_orb_matches})",
+            "Move slowly; keep 60-80% visual overlap",
             (15, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -413,18 +352,7 @@ class RoomRecordingApplication:
             2,
             cv2.LINE_AA,
         )
-        if not overlap_ready:
-            cv2.putText(
-                preview,
-                "RETURN TO LAST VIEW / MOVE SLOWER",
-                (15, 125),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (30, 30, 240),
-                2,
-                cv2.LINE_AA,
-            )
-        elif valid_percentage < self.depth_warning_percentage:
+        if valid_percentage < self.depth_warning_percentage:
             cv2.putText(
                 preview,
                 "LOW DEPTH QUALITY - CONTINUE SLOWLY",
@@ -443,9 +371,19 @@ class WorkerArguments:
     def parse() -> argparse.Namespace:
         parser = argparse.ArgumentParser(description="Record one RGB-D room scan")
         parser.add_argument("--output", required=True, type=Path)
+        parser.add_argument(
+            "--rgb-backend",
+            choices=("MSMF", "DSHOW"),
+            default="MSMF",
+            help="Windows UVC backend used for the Astra RGB interface",
+        )
         return parser.parse_args()
 
 
 if __name__ == "__main__":
     arguments = WorkerArguments.parse()
-    raise SystemExit(RoomRecordingApplication(arguments.output).run())
+    application = RoomRecordingApplication(
+        arguments.output,
+        rgb_backend=arguments.rgb_backend,
+    )
+    raise SystemExit(application.run())

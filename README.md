@@ -69,3 +69,19 @@ C:\1 Swinburne\Sem 6\openni\OpenNI\OpenNI_2.3.0.86_202210111950_4c8f5aa4_beta6_w
 
 If OpenNI is moved later, set `OPENNI2_REDIST` to the folder containing
 `OpenNI2.dll`.
+# Stage 11: RTAB-Map live room scanning
+
+Run `11_launch_rtabmap_room_scanner.py` to create a new timestamped mapping
+session and open RTAB-Map. Each session is stored under
+`output/rtabmap_sessions/` as an editable `room_mapping.db` SLAM database.
+
+On the first run, open **Edit > Preferences > Source**, choose an **RGB-D**
+source and the **OpenNI2** driver, then verify the RGB and depth previews before
+pressing **Start**. Move slowly and keep previously observed objects in view so
+visual odometry has enough overlap. Revisit an earlier area to give RTAB-Map a
+chance to detect a loop closure and correct accumulated drift.
+
+The database is kept instead of immediately reducing the scan to PLY because it
+contains the original frames, camera trajectory and graph constraints needed to
+inspect or improve the reconstruction. Export the final point cloud/mesh after
+the scan has been checked.

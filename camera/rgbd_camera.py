@@ -25,6 +25,7 @@ class RGBDCamera:
         self,
         runtime_path: str | Path | None = None,
         rgb_camera_index: int = 0,
+        rgb_backends: tuple[int, ...] | None = None,
     ) -> None:
         self.depth_camera = DepthCamera(
             runtime_path,
@@ -37,7 +38,7 @@ class RGBDCamera:
             requested_height=480,
             # MSMF has been more stable than DirectShow while the OpenNI
             # interface of the same composite Astra device is already active.
-            backends=(cv2.CAP_MSMF, cv2.CAP_DSHOW),
+            backends=rgb_backends or (cv2.CAP_MSMF, cv2.CAP_DSHOW),
         )
         self.registration_enabled = False
 
