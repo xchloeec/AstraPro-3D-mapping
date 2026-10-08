@@ -12,7 +12,9 @@ import cv2
 import numpy as np
 
 from camera import OpenNIError, RGBCameraError, RGBDCamera
+from camera.rgbd_adapter import RGBDFrameAdapter
 from processing import DepthIntrinsics
+from processing.photometric import light_metrics
 
 
 class RoomRecordingApplication:
@@ -25,6 +27,7 @@ class RoomRecordingApplication:
         capture_interval_seconds: float = 0.1,
         minimum_valid_percentage: float = 30.0,
         rgb_backend: str = "MSMF",
+        manual_control: bool = False,
     ) -> None:
         self.output_path = output_path
         self.colour_path = output_path / "color"
@@ -34,6 +37,9 @@ class RoomRecordingApplication:
         self.config_path = output_path / "open3d_config.json"
         self.summary_path = output_path / "recording_summary.txt"
         self.target_frames = target_frames
+        self.manual_control = manual_control
+        self.pause_flag = output_path / "_paused.flag"
+        self.stop_flag = output_path / "_stop_requested.flag"
         self.capture_interval_seconds = capture_interval_seconds
         self.minimum_valid_percentage = minimum_valid_percentage
         self.rgb_backend = rgb_backend
@@ -45,7 +51,7 @@ class RoomRecordingApplication:
         self.colour_path.mkdir(parents=True, exist_ok=True)
         self.depth_path.mkdir(parents=True, exist_ok=True)
         next_index = self._next_frame_index()
-        if next_index >= self.target_frames:
+        if self.target_frames > 0 and next_index >= self.target_frames:
             print("The recording already contains all requested frames.")
             return 0
 
@@ -68,15 +74,15 @@ class RoomRecordingApplication:
                 "DSHOW": cv2.CAP_DSHOW,
             }[self.rgb_backend]
             print(f"Requested RGB backend: {self.rgb_backend}", flush=True)
-            with RGBDCamera(
+            with RGBDFrameAdapter(RGBDCamera(
                 rgb_camera_index=0,
                 rgb_backends=(backend,),
-            ) as camera:
+            )) as adapter:
                 for _ in range(30):
-                    camera.read()
+                    adapter.read()
 
                 horizontal_fov, vertical_fov = (
-                    camera.depth_camera.get_field_of_view()
+                    adapter.camera.depth_camera.get_field_of_view()
                 )
                 self._write_intrinsic_and_config(
                     horizontal_fov,
@@ -84,29 +90,74 @@ class RoomRecordingApplication:
                     width=640,
                     height=480,
                 )
+                (self.output_path / "capture_metadata.json").write_text(json.dumps({
+                    "pairing": "nearest software timestamp", "maximum_pair_offset_ms": 25.,
+                    "hardware_synchronised": False,
+                    "depth_to_colour_registration_enabled": adapter.camera.registration_enabled,
+                    "intrinsic_source": "OpenNI depth field-of-view estimate",
+                    "spatial_calibration_measured": False,
+                },indent=2),encoding="utf-8")
 
-                while next_index < self.target_frames:
-                    depth_mm, colour_bgr = camera.read()
+                while self.target_frames == 0 or next_index < self.target_frames:
+                    if self.stop_flag.exists():
+                        break
+                    frame = adapter.read()
+                    depth_mm, colour_bgr = frame.depth_mm, frame.colour_bgr
+                    self.pair_offset_ms = frame.timestamp_difference_ms
                     now = time.perf_counter()
                     valid_percentage = self._valid_percentage(depth_mm)
                     candidate_count += 1
+                    lighting = light_metrics(colour_bgr)
 
                     preview = self._create_preview(
                         colour_bgr,
                         next_index,
                         valid_percentage,
                     )
+                    if lighting["median_luma"] < 45 or lighting["dark_fraction"] > .5:
+                        cv2.putText(preview,"LOW LIGHT: add light / hold camera steady",
+                                    (15,215),cv2.FONT_HERSHEY_SIMPLEX,.5,(0,180,255),2,cv2.LINE_AA)
+                    try:
+                        status = json.loads((self.output_path / "tracking_status.json").read_text())
+                    except (OSError, ValueError):
+                        status = None
+                    if status is not None:
+                        tracked = status["tracked"]
+                        text = ("TRACKING OK" if tracked else "TRACKING LOST - return to reference")
+                        cv2.putText(preview, f"{text} | processed {status['processed_frame']}",
+                                    (15,155),cv2.FONT_HERSHEY_SIMPLEX,.5,
+                                    (60,220,60) if tracked else (40,40,230),2,cv2.LINE_AA)
+                        if not tracked and status.get("last_tracked_frame") is not None:
+                            reference = cv2.imread(str(self.colour_path / f"{status['last_tracked_frame']:05d}.jpg"))
+                            if reference is not None:
+                                cv2.imshow("Return to this tracked view",cv2.resize(reference,(320,240)))
+                        elif tracked:
+                            try:
+                                cv2.destroyWindow("Return to this tracked view")
+                            except cv2.error:
+                                pass
                     cv2.imshow("Stage 9 - Open3D room recording", preview)
                     key = cv2.waitKey(1) & 0xFF
                     if key in (ord("q"), 27):
                         print("User requested an early stop.", flush=True)
-                        return 2
+                        self.stop_flag.write_text("user finished", encoding="utf-8")
+                        break
+                    if self.manual_control and key == ord(" "):
+                        if self.pause_flag.exists():
+                            self.pause_flag.unlink()
+                            print("Scanning resumed; keep overlap with the last view.", flush=True)
+                        else:
+                            self.pause_flag.write_text("paused", encoding="utf-8")
+                            print("Paused; return to this view before resuming.", flush=True)
+                    if self.manual_control and self.pause_flag.exists():
+                        continue
 
                     interval_ready = (
                         now - last_saved_time >= self.capture_interval_seconds
                     )
                     quality_ready = (
                         valid_percentage >= self.minimum_valid_percentage
+                        and frame.timestamp_difference_ms <= 25.0
                     )
                     if not interval_ready or not quality_ready:
                         continue
@@ -118,11 +169,22 @@ class RoomRecordingApplication:
                         -1,
                         -1.0,
                     )
+                    with (self.output_path / "pair_timing.csv").open("a", encoding="utf-8") as timing:
+                        if next_index == 0:
+                            timing.write("frame,depth_timestamp_ns,colour_timestamp_ns,offset_ms\n")
+                        timing.write(f"{next_index},{frame.depth_timestamp_ns},{frame.colour_timestamp_ns},{frame.timestamp_difference_ms:.3f}\n")
                     accepted_quality.append(valid_percentage)
+                    light_log = self.output_path / "lighting_quality.csv"
+                    new_light_log = not light_log.exists()
+                    with light_log.open("a",newline="",encoding="utf-8") as file:
+                        writer = csv.DictWriter(file,fieldnames=["frame",*lighting.keys()])
+                        if new_light_log:
+                            writer.writeheader()
+                        writer.writerow({"frame":next_index,**lighting})
                     next_index += 1
                     last_saved_time = now
                     print(
-                        f"Saved frame {next_index:03d}/{self.target_frames}: "
+                        f"Saved frame {next_index:03d}/{self.target_frames or 'unlimited'}: "
                         f"{valid_percentage:.2f}% valid depth",
                         flush=True,
                     )
@@ -144,7 +206,7 @@ class RoomRecordingApplication:
     def _next_frame_index(self) -> int:
         colour_indices = {path.stem for path in self.colour_path.glob("*.jpg")}
         depth_indices = {path.stem for path in self.depth_path.glob("*.png")}
-        complete = sorted(colour_indices & depth_indices)
+        complete = sorted(colour_indices & depth_indices, key=int)
         if not complete:
             return 0
         expected = [f"{index:05d}" for index in range(len(complete))]
@@ -162,15 +224,24 @@ class RoomRecordingApplication:
     ) -> None:
         colour_file = self.colour_path / f"{index:05d}.jpg"
         depth_file = self.depth_path / f"{index:05d}.png"
-        if not cv2.imwrite(
-            str(colour_file),
-            colour_bgr,
-            [cv2.IMWRITE_JPEG_QUALITY, 95],
-        ):
+        colour_ok, colour_data = cv2.imencode(".jpg",colour_bgr,[cv2.IMWRITE_JPEG_QUALITY,95])
+        depth_ok, depth_data = cv2.imencode(".png",depth_mm)
+        if not colour_ok:
             raise RuntimeError(f"Could not write {colour_file}")
-        if not cv2.imwrite(str(depth_file), depth_mm):
-            colour_file.unlink(missing_ok=True)
+        if not depth_ok:
             raise RuntimeError(f"Could not write {depth_file}")
+        # Publish only complete encoded images. A live reader must not see a
+        # half-written PNG merely because its final filename already exists.
+        colour_pending = colour_file.with_suffix(".jpg.part")
+        depth_pending = depth_file.with_suffix(".png.part")
+        try:
+            colour_pending.write_bytes(colour_data.tobytes())
+            depth_pending.write_bytes(depth_data.tobytes())
+            depth_pending.replace(depth_file)
+            colour_pending.replace(colour_file)
+        finally:
+            colour_pending.unlink(missing_ok=True)
+            depth_pending.unlink(missing_ok=True)
 
     def _valid_percentage(self, depth_mm: np.ndarray) -> float:
         valid = (
@@ -295,15 +366,16 @@ class RoomRecordingApplication:
                 "Stage 9 Open3D room recording",
                 "=============================",
                 f"Saved RGB-D pairs:          {len(quality)}",
-                f"Target RGB-D pairs:         {self.target_frames}",
+                f"Target RGB-D pairs:         {self.target_frames or 'unlimited'}",
                 f"Capture interval:           {self.capture_interval_seconds:.3f} s",
                 f"Approximate accepted rate:  {1/self.capture_interval_seconds:.1f} fps",
                 f"Quality threshold:          {self.minimum_valid_percentage:.2f}%",
                 f"Depth warning threshold:    {self.depth_warning_percentage:.2f}%",
                 "Online ORB overlap check:    disabled for camera stability",
-                f"Mean valid depth:           {float(np.mean(quality)):.2f}%",
-                f"Minimum valid depth:        {float(np.min(quality)):.2f}%",
-                f"Maximum valid depth:        {float(np.max(quality)):.2f}%",
+                "RGB-D pairing:              nearest software timestamp; accepted offset <=25 ms",
+                f"Mean valid depth:           {float(np.mean(quality)) if quality else 0.0:.2f}%",
+                f"Minimum valid depth:        {float(np.min(quality)) if quality else 0.0:.2f}%",
+                f"Maximum valid depth:        {float(np.max(quality)) if quality else 0.0:.2f}%",
                 "ORB overlap:                 validate offline after recording",
                 f"Candidates in final attempt:{candidates_this_attempt:8d}",
             ]
@@ -320,11 +392,12 @@ class RoomRecordingApplication:
         preview = colour_bgr.copy()
         ready = (
             valid_percentage >= self.minimum_valid_percentage
+            and getattr(self,"pair_offset_ms",0.) <= 25.
         )
         colour = (60, 220, 60) if ready else (40, 40, 230)
         cv2.putText(
             preview,
-            f"saved {next_index}/{self.target_frames}",
+            f"saved {next_index}/{self.target_frames or 'unlimited'}",
             (15, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.75,
@@ -334,7 +407,7 @@ class RoomRecordingApplication:
         )
         cv2.putText(
             preview,
-            f"valid depth {valid_percentage:.1f}%  |  Q/Esc stop",
+            f"depth {valid_percentage:.1f}% | pair {getattr(self, 'pair_offset_ms', 0):.1f} ms | Q/Esc finish",
             (15, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -344,7 +417,9 @@ class RoomRecordingApplication:
         )
         cv2.putText(
             preview,
-            "Move slowly; keep 60-80% visual overlap",
+            ("PAUSED - Space: play; return to last view" if self.pause_flag.exists()
+             else "SCANNING - Space: pause" if self.manual_control
+             else "Move slowly; keep 60-80% visual overlap"),
             (15, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -363,6 +438,9 @@ class RoomRecordingApplication:
                 2,
                 cv2.LINE_AA,
             )
+        if getattr(self,"pair_offset_ms",0.) > 25.:
+            cv2.putText(preview,"RGB-D TIMING TOO FAR APART - FRAME SKIPPED",
+                        (15,185),cv2.FONT_HERSHEY_SIMPLEX,.5,(40,40,230),2,cv2.LINE_AA)
         return preview
 
 
@@ -377,7 +455,12 @@ class WorkerArguments:
             default="MSMF",
             help="Windows UVC backend used for the Astra RGB interface",
         )
-        return parser.parse_args()
+        parser.add_argument("--frames", type=int, default=600, help="0 means unlimited")
+        parser.add_argument("--manual-control", action="store_true")
+        args = parser.parse_args()
+        if args.frames < 0:
+            parser.error("--frames must be nonnegative")
+        return args
 
 
 if __name__ == "__main__":
@@ -385,5 +468,7 @@ if __name__ == "__main__":
     application = RoomRecordingApplication(
         arguments.output,
         rgb_backend=arguments.rgb_backend,
+        target_frames=arguments.frames,
+        manual_control=arguments.manual_control,
     )
     raise SystemExit(application.run())

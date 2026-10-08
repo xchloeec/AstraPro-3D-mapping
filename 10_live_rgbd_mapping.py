@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import subprocess
+import os
 import sys
 import time
 
@@ -12,7 +13,7 @@ import time
 class LiveMappingSupervisor:
     """Keep camera capture and Open3D mapping in isolated processes."""
 
-    def __init__(self, maximum_camera_attempts: int = 5) -> None:
+    def __init__(self, maximum_camera_attempts: int = 5, manual_control: bool = False) -> None:
         self.project_root = Path(__file__).resolve().parent
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.dataset_path = (
@@ -24,11 +25,14 @@ class LiveMappingSupervisor:
         self.camera_worker = self.project_root / "09_room_recording_worker.py"
         self.mapping_worker = self.project_root / "10_live_mapping_worker.py"
         self.maximum_camera_attempts = maximum_camera_attempts
+        self.manual_control = manual_control
 
     def run(self) -> int:
         self.dataset_path.mkdir(parents=True, exist_ok=True)
         finished_flag = self.dataset_path / "_capture_finished.flag"
         stop_flag = self.dataset_path / "_stop_requested.flag"
+        if self.manual_control:
+            (self.dataset_path / "_paused.flag").write_text("waiting for play", encoding="utf-8")
         print(f"Stage 10 live dataset: {self.dataset_path}", flush=True)
 
         mapper = subprocess.Popen(
@@ -42,7 +46,7 @@ class LiveMappingSupervisor:
                 "3",
                 "--voxel",
                 "0.04",
-            ]
+            ], env={**os.environ, "OMP_NUM_THREADS": "4"}
         )
 
         camera_result = 1
@@ -68,11 +72,12 @@ class LiveMappingSupervisor:
                         str(self.dataset_path),
                         "--rgb-backend",
                         backend,
-                    ]
+                    ] + (["--frames", "0", "--manual-control"] if self.manual_control else [])
                 )
 
                 while camera.poll() is None:
-                    if stop_flag.exists() or mapper.poll() is not None:
+                    if mapper.poll() is not None:
+                        stop_flag.write_text("mapper exited", encoding="utf-8")
                         camera.terminate()
                         camera.wait(timeout=5)
                         camera_result = 2
@@ -97,7 +102,7 @@ class LiveMappingSupervisor:
         try:
             # Live odometry can accumulate a backlog while capture remains at
             # 10 FPS. Give it enough time to finish and save live_map.ply.
-            mapper_result = mapper.wait(timeout=900.0)
+            mapper_result = mapper.wait()
         except subprocess.TimeoutExpired:
             mapper.terminate()
             mapper_result = mapper.wait(timeout=10.0)
@@ -105,7 +110,7 @@ class LiveMappingSupervisor:
         output = self.dataset_path / "live_map.ply"
         if output.is_file():
             print(f"\nStage 10 live PLY: {output}", flush=True)
-        if camera_result == 0 and mapper_result == 0:
+        if camera_result in (0, 2) and mapper_result == 0:
             print("Stage 10 completed successfully.", flush=True)
             return 0
         print(

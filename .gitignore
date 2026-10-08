@@ -8,6 +8,7 @@
 
 # Local Python environment and caches
 .venv/
+.venv-lingbot/
 venv/
 __pycache__/
 *.py[cod]
@@ -23,6 +24,10 @@ report_evidence/
 
 # Downloaded third-party source
 external/
+weights/
+tmp/
+ScreenCamera_*.json
+ScreenCapture_*.png
 
 # Local credentials
 .env

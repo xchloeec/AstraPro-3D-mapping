@@ -124,7 +124,7 @@ class RGBDFrameAdapter:
         try:
             while not self._stop_colour_reader.is_set():
                 colour_bgr = self.camera.rgb_camera.read()
-                timestamp_ns = time.perf_counter_ns()
+                timestamp_ns = getattr(self.camera.rgb_camera,'last_timestamp_ns',None) or time.perf_counter_ns()
                 with self._colour_condition:
                     self._colour_buffer.append((timestamp_ns, colour_bgr.copy()))
                     self._colour_condition.notify_all()
